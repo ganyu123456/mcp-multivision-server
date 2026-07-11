@@ -1,0 +1,264 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., 1.0.0)"
+        required: true
+        default: "1.0.0"
+
+env:
+  REGISTRY: harbor.zkjgy.online
+  PROJECT: library
+  IMAGE_NAME: mcp-multivision-server
+
+jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_tag: ${{ steps.meta.outputs.is_tag }}
+    steps:
+      - id: meta
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            V="${GITHUB_REF#refs/tags/v}"
+            echo "version=$V" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "version=latest" >> $GITHUB_OUTPUT
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-amd64:
+    name: Build amd64
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-amd64
+
+      - name: Save image for offline release
+        if: needs.version.outputs.is_tag == 'true'
+        run: |
+          docker pull --platform linux/amd64 \
+            ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-amd64
+          docker save \
+            ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-amd64 \
+            | gzip > ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-amd64.tar.gz
+
+      - name: Upload amd64 artifact
+        if: needs.version.outputs.is_tag == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-amd64
+          path: ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-amd64.tar.gz
+          retention-days: 1
+
+  build-arm64:
+    name: Build arm64
+    needs: version
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-arm64
+
+      - name: Save image for offline release
+        if: needs.version.outputs.is_tag == 'true'
+        run: |
+          docker pull --platform linux/arm64 \
+            ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-arm64
+          docker save \
+            ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}-arm64 \
+            | gzip > ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-arm64.tar.gz
+
+      - name: Upload arm64 artifact
+        if: needs.version.outputs.is_tag == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-arm64
+          path: ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-arm64.tar.gz
+          retention-days: 1
+
+  manifest:
+    name: Create multi-arch manifest
+    runs-on: ubuntu-latest
+    needs:
+      - version
+      - build-amd64
+      - build-arm64
+    steps:
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifests
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          BASE="${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}"
+
+          docker buildx imagetools create \
+            --tag "${BASE}:${V}" \
+            "${BASE}:${V}-amd64" \
+            "${BASE}:${V}-arm64"
+
+          docker buildx imagetools create \
+            --tag "${BASE}:latest" \
+            "${BASE}:${V}-amd64" \
+            "${BASE}:${V}-arm64"
+
+          echo "Manifest ${BASE}:${V} and ${BASE}:latest created"
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - version
+      - build-amd64
+      - build-arm64
+      - manifest
+    if: needs.version.outputs.is_tag == 'true'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download amd64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: image-amd64
+          path: release
+
+      - name: Download arm64 image
+        uses: actions/download-artifact@v4
+        with:
+          name: image-arm64
+          path: release
+
+      - name: Prepare release files
+        run: |
+          V="${{ needs.version.outputs.version }}"
+          PKG="${{ env.IMAGE_NAME }}_v${V}"
+
+          mkdir -p "$PKG"
+          cp docker-compose.yaml "$PKG/"
+          cp .env.example "$PKG/.env"
+
+          # 将发布包 .env 中的 MCP_IMAGE 取消注释并锁定到本次发布版本
+          IMAGE="${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${V}"
+          sed -i "s|^# MCP_IMAGE=harbor.*|MCP_IMAGE=${IMAGE}|" "$PKG/.env"
+
+          cd release
+          sha256sum * > checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ format('v{0}', needs.version.outputs.version) }}
+          name: "MCP Multivision Server v${{ needs.version.outputs.version }}"
+          generate_release_notes: true
+          body: |
+            ## MCP Multivision Server v${{ needs.version.outputs.version }}
+
+            为大模型提供图片与视频分析能力的 MCP Server：本地 ffmpeg/OpenCV 抽帧与 CV 预处理 + OpenAI 兼容视觉大模型理解。
+
+            ### 文件说明
+
+            | 文件 | 说明 |
+            |------|------|
+            | `${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}/` | 运行包（docker-compose + 配置） |
+            | `${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-amd64.tar.gz` | x86_64 镜像 |
+            | `${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-arm64.tar.gz` | ARM64 镜像 |
+
+            ### 离线部署
+
+            ```bash
+            # 1. 加载对应架构的镜像
+            docker load -i ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}_linux-amd64.tar.gz
+
+            # 2. 编辑 .env，填入云端视觉大模型配置（OpenAI 兼容）
+            cd ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}
+            #   MCP_VISION_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+            #   MCP_VISION_API_KEY=your_api_key
+            #   MCP_VISION_MODEL=qwen-vl-max
+
+            # 3. 启动
+            docker compose up -d
+            ```
+
+            ### 在线部署（从 Harbor 拉取）
+
+            ```bash
+            docker login ${{ env.REGISTRY }}
+            docker pull ${{ env.REGISTRY }}/${{ env.PROJECT }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.version }}
+            ```
+
+            编辑 `.env` 中 `MCP_IMAGE` 指向 Harbor 地址，然后 `docker compose up -d`。
+
+            ### MCP 客户端配置
+
+            ```json
+            {
+              "mcpServers": {
+                "multivision": {
+                  "url": "http://<your-server>:8093/sse"
+                }
+              }
+            }
+            ```
+
+            ### 校验
+            ```bash
+            sha256sum -c checksums.txt
+            ```
+
+          files: |
+            release/*
+            ${{ env.IMAGE_NAME }}_v${{ needs.version.outputs.version }}/*
