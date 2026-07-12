@@ -1,7 +1,7 @@
 [project]
 name = "mcp-multivision-server"
-version = "1.0.0"
-description = "MCP Multivision Server - Image and video analysis tools for LLM agents (local ffmpeg/OpenCV preprocessing + OpenAI-compatible vision models)"
+version = "2.0.0"
+description = "MCP Multivision Server - Cloud image & video analysis for LLM agents (OpenAI-compatible vision models, native video via Qwen3.5)"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
@@ -23,8 +23,6 @@ dependencies = [
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
     "pillow>=10.0.0",
-    "opencv-python-headless>=4.8.0,<5.0.0",
-    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

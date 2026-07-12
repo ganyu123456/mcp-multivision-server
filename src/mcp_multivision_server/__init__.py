@@ -1,3 +1,3 @@
-"""MCP Multivision Server - Image and video analysis tools for LLM agents."""
+"""MCP Multivision Server - Cloud image and video analysis tools for LLM agents."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
